@@ -271,3 +271,46 @@ def test_taking_a_root_leaves_its_top_writable_by_the_login_alone(tmp_path):
     assert (root / "ws").stat().st_mode & 0o777 == 0o755
     # Below the top the folders are the owner's to keep as they are.
     assert (root / "ws" / ".agents").stat().st_mode & 0o777 == 0o775
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.parametrize(
+    "folder,computer_id,exit_code",
+    [
+        ("Documents/existing", None, 16),
+        ("Documents/new", None, 16),
+        ("Library/Mobile Documents/com~apple~CloudDocs/la", None, 17),
+        ("Library/Mobile Documents/com~apple~CloudDocs/la", "c" * 32, 0),
+    ],
+    ids=["privacy-existing", "privacy-new", "icloud-new", "icloud-already-working"],
+)
+def test_a_folder_the_mac_keeps_private_or_syncs_is_refused(
+    tmp_path, folder, computer_id, exit_code
+):
+    """macOS's privacy controls fail a listing the file modes allow, which
+    read as an empty folder; iCloud Drive would upload the computer's
+    credentials, so a new folder there is refused but a working one starts."""
+    home = tmp_path.resolve() / "home"
+    (home / "Documents" / "existing").mkdir(parents=True)
+    (home / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "la").mkdir(
+        parents=True
+    )
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "ls").write_text(
+        '#!/bin/sh\nfor a; do case $a in */Documents*) '
+        'echo "ls: $a: Operation not permitted" >&2; exit 1;; esac; done\n'
+        'exec /bin/ls "$@"\n'
+    )
+    (shim / "ls").chmod(0o755)
+    script = root_dir_script(
+        f"{home}/{folder}", computers=computers_dir(str(home)), computer_id=computer_id
+    )
+
+    done = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{shim}:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home)},
+        capture_output=True,
+    )
+
+    assert done.returncode == exit_code

@@ -515,17 +515,23 @@ def root_dir_script(path: str, *, computers: str, computer_id: str | None) -> st
     folder it checked and the real path it has (``adopted_root``). Claims on
     one login run one at a time and make the claiming computer's folder under
     *computers*, so two starts at once cannot both take a folder; exit 15
-    is one that waited too long for its turn. Any other exit is one
-    ``root_dir_error`` words.
+    is one that waited too long for its turn. Exit 16 is a folder macOS's
+    privacy controls keep the login from listing (Desktop, Documents,
+    Downloads, iCloud Drive), which would otherwise read as empty. A new
+    folder is refused in iCloud Drive with exit 17, since it would upload the
+    credentials the computer keeps there; a computer already working in one
+    keeps starting. Any other exit is one ``root_dir_error`` words.
     """
     i = SandboxLayout.INTERNAL_DIR
     if computer_id is None:
         make, sudo, claim, hold = "exit 0", "sudo -n true", "exit 0", ""
+        synced = 'case "$1/" in "$hd/Library/Mobile Documents/"*) exit 17 ;; esac'
     else:
         make = 'mkdir -p -- "$w" 2>/dev/null && claim'
         sudo = 'sudo -n install -d -o "$(id -un)" -g "$(id -gn)" -- "$w"'
         claim = "claim"
         hold = _CLAIM_HOLD
+        synced = ":"
     return (
         f"w={shlex.quote(path)}; c={shlex.quote(computers)}; "
         f'me={shlex.quote(computer_id or "")}; m="$w/{ROOT_MARKER}"; o=\n'
@@ -548,10 +554,21 @@ def root_dir_script(path: str, *, computers: str, computer_id: str | None) -> st
         '  mkdir -p -- "$c/$me" && chmod 700 "$c/$me" || exit 9\n'
         "  exit 0\n"
         "}\n"
-        'real() { r=$(cd -P -- "$1" 2>/dev/null && env pwd -P); [ "$r" = "$1" ] && return; '
+        'hd=$(cd -P -- "$HOME" 2>/dev/null && env pwd -P)\n'
+        'real() { r=$(cd -P -- "$1" 2>/dev/null && env pwd -P); '
+        '[ "$r" = "$1" ] && return; '
         "printf '%s\\n%s\\n' \"$1\" \"$r\"; exit 12; }\n"
+        # Only a check refuses a folder in iCloud Drive: a computer already
+        # working in one keeps starting.
+        f"synced() {{ {synced} ; }}\n"
+        # The privacy controls deny with EPERM, where file modes deny with
+        # EACCES, and may deny a folder whose modes let the login in.
+        'tcc() { case $(LC_ALL=C ls -A -- "$1" 2>&1 >/dev/null) in '
+        '*"not permitted"*) exit 16 ;; esac; }\n'
+        # Where the folder is, asked of it or of the parent it would be made in.
+        'place() { real "$1"; synced "$1"; tcc "$1"; }\n'
         'if [ -d "$w" ]; then\n'
-        '  real "$w"\n'
+        '  place "$w"\n'
         '  [ -r "$w" ] && [ -w "$w" ] && [ -x "$w" ] || exit 4\n'
         '  [ -z "$(find "$w" -prune -perm -0002 2>/dev/null)" ] || exit 11\n'
         '  [ -O "$w" ] || exit 13\n'
@@ -560,7 +577,8 @@ def root_dir_script(path: str, *, computers: str, computer_id: str | None) -> st
         '    if [ -n "$o" ] && [ "$o" != "$me" ] && [ -d "$c/$o" ]; then\n'
         "      printf '%s\\n' \"$o\"; exit 10\n"
         "    fi\n"
-        '  elif [ -n "$(ls -A -- "$w" | head -n 1)" ]; then\n'
+        # A listing that fails reads as one with files, never as empty.
+        '  elif [ -n "$({ ls -A -- "$w" || echo /; } 2>/dev/null | head -n 1)" ]; then\n'
         '    [ -n "$me" ] && [ -d "$c/$me" ] || exit 8\n'
         "  fi\n"
         f"  {claim}\n"
@@ -568,7 +586,7 @@ def root_dir_script(path: str, *, computers: str, computer_id: str | None) -> st
         '[ -e "$w" ] && exit 6\n'
         'p=$w; while [ ! -e "$p" ]; do p=$(dirname -- "$p"); done\n'
         '[ -d "$p" ] || exit 7\n'
-        'real "$p"\n'
+        'place "$p"\n'
         f'if [ -w "$p" ] && [ -x "$p" ]; then {make}; fi\n'
         f"e=$(LC_ALL=C {sudo} </dev/null 2>&1 >/dev/null) && {claim}\n"
         'case "$e" in *tty*) exit 5 ;; esac\n'
@@ -641,6 +659,19 @@ def root_dir_error(
     elif exit_code == 14:
         message = f"Could not make {path} on {host} writable by {user} alone."
         choose = "Choose a folder on a disk that keeps file permissions."
+    elif exit_code == 16:
+        message = f"macOS keeps {user} from reading {path} on {host}."
+        choose = (
+            "Allow it under System Settings > Privacy & Security > Full Disk "
+            "Access, or choose a folder outside Desktop, Documents, Downloads "
+            "and iCloud Drive."
+        )
+    elif exit_code == 17:
+        message = (
+            f"{path} on {host} is in iCloud Drive, which would upload the "
+            "credentials the computer keeps in its folder."
+        )
+        choose = "Choose a folder outside iCloud Drive."
     else:
         message = (
             f"Could not create {path} on {host}: {user} cannot write to its "
