@@ -16,12 +16,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from ptc_agent.core.sandbox.providers._ssh_root import root_dir_script
 from ptc_agent.core.sandbox.providers._ssh_shell import (
     computer_dir,
     computers_dir,
     delete_script,
     layout_script,
-    root_dir_script,
 )
 from ptc_agent.core.sandbox.providers._ssh_transport import HostFacts, Link
 from ptc_agent.core.sandbox.providers.ssh_runtime import SSHRuntime
@@ -172,9 +172,85 @@ def test_the_create_probe_clears_only_a_removed_computers_mark(
     link = SimpleNamespace(run=run)
     assert (
         asyncio.run(_check_root(link, root, home=home, reclaim=reclaim, timeout=30))
-        == checked
+        == (*checked, root)
     )
     assert (tmp_path / ".langalpha" / "computers" / "c1").exists() is not bool(reclaim)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_a_take_over_of_a_folder_renamed_since_stops_nothing(tmp_path):
+    """The take-over keeps the spelling the create's probe found, so a folder
+    renamed since is refused before the computer marking it is stopped."""
+    from ptc_agent.core.sandbox.providers.ssh import _check_root
+
+    home = str(tmp_path.resolve())
+
+    async def run(script: str, *, timeout: float, root: bool = False):
+        done = subprocess.run(["bash", "-c", script], capture_output=True)
+        return SimpleNamespace(exit_code=done.returncode, stdout=done.stdout)
+
+    claim = root_dir_script(
+        f"{home}/LangAlpha", computers=computers_dir(home), computer_id="c1"
+    )
+    for script in (claim, layout_script(computer_dir(home, "c1"))):
+        assert subprocess.run(["bash", "-c", script]).returncode == 0
+    if not (tmp_path / "langalpha").exists():
+        pytest.skip("the disk tells names apart by case")
+
+    checked = asyncio.run(
+        _check_root(
+            SimpleNamespace(run=run),
+            f"{home}/langalpha",
+            home=home,
+            reclaim=("c1",),
+            timeout=30,
+            adopt=False,
+        )
+    )
+
+    assert checked.exit_code == 12
+    assert (tmp_path / ".langalpha" / "computers" / "c1").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.parametrize(
+    "typed,checked",
+    [
+        ("research", (0, "", "Research")),
+        ("Cafe\u0301", (0, "", "Caf\u00e9")),
+        ("RESEARCH/new", (0, "", "Research/new")),
+        ("link", (12, "", "link")),
+    ],
+    ids=["case", "normalization", "parent-case", "symlink"],
+)
+def test_a_folder_typed_in_another_spelling_is_kept_as_the_disk_has_it(
+    tmp_path, typed, checked
+):
+    """A case-insensitive disk takes either spelling for one folder, so a root
+    typed in other letter case or Unicode normalization is the folder there,
+    kept as the disk spells it; one reached through a symbolic link is still
+    refused."""
+    from ptc_agent.core.sandbox.providers.ssh import _check_root
+
+    home = str(tmp_path.resolve())
+    (tmp_path / "Research").mkdir()
+    (tmp_path / "Caf\u00e9").mkdir()
+    (tmp_path / "target").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "target")
+    if not (tmp_path / "RESEARCH").exists() or not (tmp_path / "Cafe\u0301").exists():
+        pytest.skip("the disk tells names apart by case or normalization")
+
+    async def run(script: str, *, timeout: float, root: bool = False):
+        done = subprocess.run(["bash", "-c", script], capture_output=True)
+        return SimpleNamespace(exit_code=done.returncode, stdout=done.stdout)
+
+    exit_code, owner, root = asyncio.run(
+        _check_root(
+            SimpleNamespace(run=run), f"{home}/{typed}", home=home, reclaim=(), timeout=30
+        )
+    )
+
+    assert (exit_code, owner, root) == (checked[0], checked[1], f"{home}/{checked[2]}")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
@@ -195,3 +271,46 @@ def test_taking_a_root_leaves_its_top_writable_by_the_login_alone(tmp_path):
     assert (root / "ws").stat().st_mode & 0o777 == 0o755
     # Below the top the folders are the owner's to keep as they are.
     assert (root / "ws" / ".agents").stat().st_mode & 0o777 == 0o775
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+@pytest.mark.parametrize(
+    "folder,computer_id,exit_code",
+    [
+        ("Documents/existing", None, 16),
+        ("Documents/new", None, 16),
+        ("Library/Mobile Documents/com~apple~CloudDocs/la", None, 17),
+        ("Library/Mobile Documents/com~apple~CloudDocs/la", "c" * 32, 0),
+    ],
+    ids=["privacy-existing", "privacy-new", "icloud-new", "icloud-already-working"],
+)
+def test_a_folder_the_mac_keeps_private_or_syncs_is_refused(
+    tmp_path, folder, computer_id, exit_code
+):
+    """macOS's privacy controls fail a listing the file modes allow, which
+    read as an empty folder; iCloud Drive would upload the computer's
+    credentials, so a new folder there is refused but a working one starts."""
+    home = tmp_path.resolve() / "home"
+    (home / "Documents" / "existing").mkdir(parents=True)
+    (home / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "la").mkdir(
+        parents=True
+    )
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "ls").write_text(
+        '#!/bin/sh\nfor a; do case $a in */Documents*) '
+        'echo "ls: $a: Operation not permitted" >&2; exit 1;; esac; done\n'
+        'exec /bin/ls "$@"\n'
+    )
+    (shim / "ls").chmod(0o755)
+    script = root_dir_script(
+        f"{home}/{folder}", computers=computers_dir(str(home)), computer_id=computer_id
+    )
+
+    done = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": f"{shim}:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home)},
+        capture_output=True,
+    )
+
+    assert done.returncode == exit_code
